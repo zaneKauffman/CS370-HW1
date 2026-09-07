@@ -6,20 +6,20 @@ BIN := build/test_rbtree
 FUZZBIN := build/fuzz
 all: $(BIN) $(FUZZBIN)
 $(BIN): $(SRC) $(TSRC) include/rbtree.h
-@mkdir -p build
-$(CC) $(CFLAGS) $(SRC) $(TSRC) -o $@
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SRC) $(TSRC) -o $@
 $(FUZZBIN): $(SRC) tests/fuzz.c include/rbtree.h
-@mkdir -p build
-$(CC) $(CFLAGS) $(SRC) tests/fuzz.c -o $@
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SRC) tests/fuzz.c -o $@
 test: $(BIN) $(FUZZBIN)
-./$(BIN) && ./$(FUZZBIN) 100000
+	./$(BIN) && ./$(FUZZBIN) 100000
 asan: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 asan: clean test
 memcheck: all
-valgrind --leak-check=full --show-leak-kinds=all \
---error-exitcode=1 ./$(BIN)
-valgrind --leak-check=full --show-leak-kinds=all \
---error-exitcode=1 ./$(FUZZBIN) 20000
+	valgrind --leak-check=full --show-leak-kinds=all \
+		--error-exitcode=1 ./$(BIN)
+	valgrind --leak-check=full --show-leak-kinds=all \
+		--error-exitcode=1 ./$(FUZZBIN) 20000
 clean:
-rm -rf build
+	rm -rf build
 .PHONY: all test asan memcheck clean
