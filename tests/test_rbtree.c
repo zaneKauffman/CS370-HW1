@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "rbtree.h"
 
@@ -35,6 +36,24 @@ static void *heap_val(void) {
 /* "k000".."k999" into caller's buffer (>= 5 bytes). */
 static void mkkey(char *buf, size_t bufsz, int i) {
     snprintf(buf, bufsz, "k%03d", i);
+}
+
+/* rb_foreach context: tracks in-order-ness, visit count, and a value checksum. */
+typedef struct {
+    const char *last_key; /* greatest key seen so far, NULL before the first */
+    int count;             /* real nodes visited so far */
+    int ordered;           /* 1 while strictly increasing so far */
+    long sum;               /* sum of values, interpreted as intptr_t */
+} foreach_ctx_t;
+
+static void foreach_visit(const char *key, void *value, void *ctx) {
+    foreach_ctx_t *fc = ctx;
+    if (fc->last_key != NULL && strcmp(fc->last_key, key) >= 0) {
+        fc->ordered = 0;
+    }
+    fc->last_key = key;
+    fc->count++;
+    fc->sum += (long)(intptr_t)value;
 }
 
 int main(void) {
@@ -405,6 +424,60 @@ int main(void) {
     }
     CHECK(rb_size(t) == 0);
     CHECK(rb_validate(t) == 0);
+    rb_destroy(t);
+
+    /* ---- rb_foreach on an empty tree: no visits ---- */
+    t = rb_create(NULL);
+    foreach_ctx_t fc = {0};
+    fc.ordered = 1;
+    rb_foreach(t, foreach_visit, &fc);
+    CHECK(fc.count == 0);
+    CHECK(fc.ordered == 1);
+
+    /* ---- rb_foreach NULL-safety: neither call visits anything ---- */
+    CHECK(rb_insert(t, "a", (void *)(intptr_t)1) == 0);
+    rb_foreach(NULL, foreach_visit, &fc);
+    CHECK(fc.count == 0);
+    rb_foreach(t, NULL, &fc);
+    CHECK(fc.count == 0);
+    rb_destroy(t);
+
+    /* ---- rb_foreach: sorted order, full coverage, value pass-through ---- */
+    t = rb_create(NULL);
+    unsigned int flcg = 555555555u;
+    int finserted = 0;
+    char fseen[100] = {0};
+    /* invariant: finserted counts distinct keys placed so far */
+    while (finserted < 100) {
+        flcg = flcg * 1103515245u + 12345u;
+        int idx = (int)((flcg >> 16) % 100u);
+        char kb[16];
+        mkkey(kb, sizeof kb, idx);
+        CHECK(rb_insert(t, kb, (void *)(intptr_t)(idx + 1)) == 0);
+        if (!fseen[idx]) {
+            fseen[idx] = 1;
+            finserted++;
+        }
+    }
+    CHECK(rb_size(t) == 100);
+    foreach_ctx_t fc2 = {0};
+    fc2.ordered = 1;
+    rb_foreach(t, foreach_visit, &fc2);
+    CHECK(fc2.ordered == 1);
+    CHECK((size_t)fc2.count == rb_size(t));
+    CHECK(fc2.sum == 5050); /* sum of 1..100 */
+
+    /* ---- rb_foreach reflects post-delete state ---- */
+    for (int i = 0; i < 100; i += 3) {
+        char kb[16];
+        mkkey(kb, sizeof kb, i);
+        CHECK(rb_delete(t, kb) == 0);
+    }
+    foreach_ctx_t fc3 = {0};
+    fc3.ordered = 1;
+    rb_foreach(t, foreach_visit, &fc3);
+    CHECK(fc3.ordered == 1);
+    CHECK((size_t)fc3.count == rb_size(t));
     rb_destroy(t);
 
     if (failures == 0) {

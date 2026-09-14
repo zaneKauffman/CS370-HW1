@@ -362,6 +362,30 @@ void *rb_find(const rbtree_t *t, const char *key) {
     return NULL;
 }
 
+/* In-order visit of the subtree rooted at n: left, then n itself, then right.
+ * invariant: every real node in the subtree is visited exactly once, in
+ * strictly increasing key order. */
+static void rb_foreach_subtree(const rbtree_t *t, const rb_node_t *n,
+                                void (*fn)(const char *key, void *value, void *ctx),
+                                void *ctx) {
+    if (n == t->nil) {
+        return;
+    }
+    rb_foreach_subtree(t, n->left, fn, ctx);
+    fn(n->key, n->value, ctx);
+    rb_foreach_subtree(t, n->right, fn, ctx);
+}
+
+/* In-order traversal; visits nothing on a NULL tree or NULL callback. */
+void rb_foreach(const rbtree_t *t,
+                void (*fn)(const char *key, void *value, void *ctx),
+                void *ctx) {
+    if (t == NULL || fn == NULL) {
+        return;
+    }
+    rb_foreach_subtree(t, t->root, fn, ctx);
+}
+
 /* CLRS RB-TRANSPLANT. Replaces the subtree rooted at u with the subtree
  * rooted at v, from u->parent's perspective; does not touch u's or v's own
  * children/color. The final assignment runs even when v == t->nil, which is
