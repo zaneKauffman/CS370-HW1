@@ -187,6 +187,226 @@ int main(void) {
     }
     rb_destroy(t);
 
+    /* ---- delete from empty tree: -1, nothing changes ---- */
+    t = rb_create(NULL);
+    CHECK(rb_delete(t, "x") == -1);
+    CHECK(rb_size(t) == 0);
+    CHECK(rb_validate(t) == 0);
+    rb_destroy(t);
+
+    /* ---- delete NULL-arg safety ---- */
+    t = rb_create(NULL);
+    CHECK(rb_insert(t, "a", (void *)(intptr_t)1) == 0);
+    CHECK(rb_delete(NULL, "a") == -1);
+    CHECK(rb_delete(t, NULL) == -1);
+    CHECK(rb_size(t) == 1);
+    CHECK(rb_find(t, "a") == (void *)(intptr_t)1);
+    rb_destroy(t);
+
+    /* ---- delete nonexistent key from non-empty tree: -1, unchanged ---- */
+    t = rb_create(NULL);
+    for (int i = 0; i < 10; i++) {
+        char kb[16];
+        mkkey(kb, sizeof kb, i);
+        CHECK(rb_insert(t, kb, (void *)(intptr_t)(i + 1)) == 0);
+    }
+    CHECK(rb_delete(t, "absent") == -1);
+    CHECK(rb_size(t) == 10);
+    CHECK(rb_validate(t) == 0);
+    for (int i = 0; i < 10; i++) {
+        char kb[16];
+        mkkey(kb, sizeof kb, i);
+        CHECK(rb_find(t, kb) == (void *)(intptr_t)(i + 1));
+    }
+    rb_destroy(t);
+
+    /* ---- delete the only node: root/leaf, back to empty ---- */
+    t = rb_create(NULL);
+    CHECK(rb_insert(t, "solo", (void *)(intptr_t)1) == 0);
+    CHECK(rb_delete(t, "solo") == 0);
+    CHECK(rb_size(t) == 0);
+    CHECK(rb_validate(t) == 0);
+    CHECK(rb_find(t, "solo") == NULL);
+    rb_destroy(t);
+
+    /* ---- one-child shapes: z->right == nil, then z->left == nil ---- */
+    t = rb_create(NULL);
+    CHECK(rb_insert(t, "k1", (void *)(intptr_t)1) == 0);
+    CHECK(rb_insert(t, "k2", (void *)(intptr_t)2) == 0);
+    /* "k1" is black root with a single red right child "k2" */
+    CHECK(rb_delete(t, "k1") == 0);
+    CHECK(rb_validate(t) == 0);
+    CHECK(rb_size(t) == 1);
+    CHECK(rb_find(t, "k2") == (void *)(intptr_t)2);
+    rb_destroy(t);
+
+    t = rb_create(NULL);
+    CHECK(rb_insert(t, "k2", (void *)(intptr_t)2) == 0);
+    CHECK(rb_insert(t, "k1", (void *)(intptr_t)1) == 0);
+    /* "k2" is black root with a single red left child "k1" */
+    CHECK(rb_delete(t, "k2") == 0);
+    CHECK(rb_validate(t) == 0);
+    CHECK(rb_size(t) == 1);
+    CHECK(rb_find(t, "k1") == (void *)(intptr_t)1);
+    rb_destroy(t);
+
+    /* ---- two-children shapes: successor is z's immediate right child ---- */
+    t = rb_create(NULL);
+    CHECK(rb_insert(t, "k2", (void *)(intptr_t)2) == 0);
+    CHECK(rb_insert(t, "k1", (void *)(intptr_t)1) == 0);
+    CHECK(rb_insert(t, "k3", (void *)(intptr_t)3) == 0);
+    /* delete root "k2": successor is "k3", its own immediate right child */
+    CHECK(rb_delete(t, "k2") == 0);
+    CHECK(rb_validate(t) == 0);
+    CHECK(rb_size(t) == 2);
+    CHECK(rb_find(t, "k1") == (void *)(intptr_t)1);
+    CHECK(rb_find(t, "k3") == (void *)(intptr_t)3);
+    CHECK(rb_find(t, "k2") == NULL);
+    rb_destroy(t);
+
+    /* ---- two-children shapes: successor deeper in z's right subtree ---- */
+    t = rb_create(NULL);
+    CHECK(rb_insert(t, "k4", (void *)(intptr_t)4) == 0);
+    CHECK(rb_insert(t, "k2", (void *)(intptr_t)2) == 0);
+    CHECK(rb_insert(t, "k6", (void *)(intptr_t)6) == 0);
+    CHECK(rb_insert(t, "k1", (void *)(intptr_t)1) == 0);
+    CHECK(rb_insert(t, "k3", (void *)(intptr_t)3) == 0);
+    CHECK(rb_insert(t, "k5", (void *)(intptr_t)5) == 0);
+    CHECK(rb_insert(t, "k7", (void *)(intptr_t)7) == 0);
+    CHECK(rb_validate(t) == 0);
+    /* delete root "k4": successor is "k5", not an immediate right child */
+    CHECK(rb_delete(t, "k4") == 0);
+    CHECK(rb_validate(t) == 0);
+    CHECK(rb_size(t) == 6);
+    CHECK(rb_find(t, "k4") == NULL);
+    CHECK(rb_find(t, "k1") == (void *)(intptr_t)1);
+    CHECK(rb_find(t, "k2") == (void *)(intptr_t)2);
+    CHECK(rb_find(t, "k3") == (void *)(intptr_t)3);
+    CHECK(rb_find(t, "k5") == (void *)(intptr_t)5);
+    CHECK(rb_find(t, "k6") == (void *)(intptr_t)6);
+    CHECK(rb_find(t, "k7") == (void *)(intptr_t)7);
+    rb_destroy(t);
+
+    /* ---- ownership on delete: value_free called exactly once per removed
+     * key, not called on destroy for the ones already removed ---- */
+    value_frees = 0;
+    t = rb_create(counting_free);
+    for (int i = 0; i < 50; i++) {
+        char kb[16];
+        mkkey(kb, sizeof kb, i);
+        CHECK(rb_insert(t, kb, heap_val()) == 0);
+    }
+    for (int i = 0; i < 20; i++) {
+        char kb[16];
+        mkkey(kb, sizeof kb, i);
+        CHECK(rb_delete(t, kb) == 0);
+    }
+    CHECK(value_frees == 20);
+    CHECK(rb_size(t) == 30);
+    CHECK(rb_validate(t) == 0);
+    rb_destroy(t);
+    CHECK(value_frees == 50);
+
+    /* ---- delete where the value was NULL: value_free not called ---- */
+    value_frees = 0;
+    t = rb_create(counting_free);
+    CHECK(rb_insert(t, "k", NULL) == 0);
+    CHECK(rb_delete(t, "k") == 0);
+    CHECK(value_frees == 0); /* guard: no value_free(NULL) */
+    rb_destroy(t);
+
+    /* ---- non-owning tree: delete doesn't free values the test still owns;
+     * asan/valgrind (not CHECK) prove no double-free here ---- */
+    t = rb_create(NULL);
+    void *dv1 = heap_val();
+    void *dv2 = heap_val();
+    CHECK(rb_insert(t, "d1", dv1) == 0);
+    CHECK(rb_insert(t, "d2", dv2) == 0);
+    CHECK(rb_delete(t, "d1") == 0);
+    CHECK(rb_delete(t, "d2") == 0);
+    CHECK(rb_size(t) == 0);
+    free(dv1);
+    free(dv2);
+    rb_destroy(t);
+
+    /* ---- bulk coverage: shuffled insert, then independently-shuffled
+     * delete of everything, validating after every single delete. This is
+     * the practical black-box way to exercise all rb_delete_fixup cases and
+     * both mirror sides, since the public API can't target node colors. ---- */
+    value_frees = 0;
+    t = rb_create(counting_free);
+    unsigned int dlcg = 987654321u;
+    int dinserted = 0;
+    char dseen[150] = {0};
+    /* invariant: dinserted counts distinct keys placed so far */
+    while (dinserted < 150) {
+        dlcg = dlcg * 1103515245u + 12345u;
+        int idx = (int)((dlcg >> 16) % 150u);
+        char kb[16];
+        mkkey(kb, sizeof kb, idx);
+        if (!dseen[idx]) {
+            CHECK(rb_insert(t, kb, heap_val()) == 0);
+            dseen[idx] = 1;
+            dinserted++;
+        }
+    }
+    CHECK(rb_size(t) == 150);
+    CHECK(rb_validate(t) == 0);
+
+    /* second, independent shuffle order for deletion */
+    unsigned int dlcg2 = 246813579u;
+    int ddeleted = 0;
+    char ddone[150] = {0};
+    /* invariant: ddeleted counts distinct keys removed so far */
+    while (ddeleted < 150) {
+        dlcg2 = dlcg2 * 1103515245u + 12345u;
+        int idx = (int)((dlcg2 >> 16) % 150u);
+        if (!ddone[idx]) {
+            char kb[16];
+            mkkey(kb, sizeof kb, idx);
+            CHECK(rb_delete(t, kb) == 0);
+            CHECK(rb_validate(t) == 0);
+            CHECK(rb_find(t, kb) == NULL);
+            ddone[idx] = 1;
+            ddeleted++;
+        }
+    }
+    CHECK(rb_size(t) == 0);
+    CHECK(rb_validate(t) == 0);
+    rb_destroy(t);
+    CHECK(value_frees == 150);
+
+    /* ---- repeated insert/delete/reinsert cycles ---- */
+    t = rb_create(NULL);
+    for (int i = 0; i < 50; i++) {
+        char kb[16];
+        mkkey(kb, sizeof kb, i);
+        CHECK(rb_insert(t, kb, (void *)(intptr_t)(i + 1)) == 0);
+    }
+    CHECK(rb_validate(t) == 0);
+    for (int i = 0; i < 50; i += 2) {
+        char kb[16];
+        mkkey(kb, sizeof kb, i);
+        CHECK(rb_delete(t, kb) == 0);
+    }
+    CHECK(rb_size(t) == 25);
+    CHECK(rb_validate(t) == 0);
+    for (int i = 0; i < 50; i += 2) {
+        char kb[16];
+        mkkey(kb, sizeof kb, i);
+        CHECK(rb_insert(t, kb, (void *)(intptr_t)(i + 100)) == 0);
+    }
+    CHECK(rb_size(t) == 50);
+    CHECK(rb_validate(t) == 0);
+    for (int i = 0; i < 50; i++) {
+        char kb[16];
+        mkkey(kb, sizeof kb, i);
+        CHECK(rb_delete(t, kb) == 0);
+    }
+    CHECK(rb_size(t) == 0);
+    CHECK(rb_validate(t) == 0);
+    rb_destroy(t);
+
     if (failures == 0) {
         puts("test_rbtree: all checks passed");
     }

@@ -361,3 +361,175 @@ void *rb_find(const rbtree_t *t, const char *key) {
     }
     return NULL;
 }
+
+/* CLRS RB-TRANSPLANT. Replaces the subtree rooted at u with the subtree
+ * rooted at v, from u->parent's perspective; does not touch u's or v's own
+ * children/color. The final assignment runs even when v == t->nil, which is
+ * exactly the "delete-fixup temporarily writes nil->parent" mechanism the
+ * struct comment on `nil` anticipates: it gives x (in rb_delete_fixup) a
+ * well-defined parent even when x is the sentinel. */
+static void rb_transplant(rbtree_t *t, rb_node_t *u, rb_node_t *v) {
+    if (u->parent == t->nil) {
+        t->root = v;
+    } else if (u == u->parent->left) {
+        u->parent->left = v;
+    } else {
+        u->parent->right = v;
+    }
+    v->parent = u->parent;
+}
+
+/* CLRS TREE-MINIMUM. Assumes n != t->nil. Returns the leftmost (smallest-key)
+ * node in the subtree rooted at n. */
+static rb_node_t *rb_minimum(rbtree_t *t, rb_node_t *n) {
+    /* invariant: n is never nil; each step strictly descends left */
+    while (n->left != t->nil) {
+        n = n->left;
+    }
+    return n;
+}
+
+/* CLRS RB-DELETE-FIXUP. x is the node that moved into a spliced-out node's
+ * position (possibly t->nil) and carries one extra unit of black-ness;
+ * restore the red-black invariants by recoloring and rotating up the tree.
+ * Precondition: x->parent is already correct, even when x == t->nil (see
+ * rb_transplant and the y->parent == z case in rb_delete). */
+static void rb_delete_fixup(rbtree_t *t, rb_node_t *x) {
+    /* invariant: x is doubly-black (or red-and-black); the loop climbs until
+     * x reaches the root or picks up enough redness to absorb locally. */
+    while (x != t->root && x->color == BLACK) {
+        if (x == x->parent->left) {
+            rb_node_t *sibling = x->parent->right;
+            if (sibling->color == RED) {
+                /* case 1: red sibling -> rotate to get a black sibling */
+                sibling->color = BLACK;
+                x->parent->color = RED;
+                left_rotate(t, x->parent);
+                sibling = x->parent->right;
+            }
+            if (sibling->left->color == BLACK && sibling->right->color == BLACK) {
+                /* case 2: both nephews black -> recolor and move up */
+                sibling->color = RED;
+                x = x->parent;
+            } else {
+                if (sibling->right->color == BLACK) {
+                    /* case 3: near nephew red -> rotate to a case-4 shape */
+                    sibling->left->color = BLACK;
+                    sibling->color = RED;
+                    right_rotate(t, sibling);
+                    sibling = x->parent->right;
+                }
+                /* case 4: far nephew red -> recolor and rotate, done */
+                sibling->color = x->parent->color;
+                x->parent->color = BLACK;
+                sibling->right->color = BLACK;
+                left_rotate(t, x->parent);
+                x = t->root;
+            }
+        } else {
+            /* mirror image: x is a right child */
+            rb_node_t *sibling = x->parent->left;
+            if (sibling->color == RED) {
+                sibling->color = BLACK;
+                x->parent->color = RED;
+                right_rotate(t, x->parent);
+                sibling = x->parent->left;
+            }
+            if (sibling->right->color == BLACK && sibling->left->color == BLACK) {
+                sibling->color = RED;
+                x = x->parent;
+            } else {
+                if (sibling->left->color == BLACK) {
+                    sibling->right->color = BLACK;
+                    sibling->color = RED;
+                    left_rotate(t, sibling);
+                    sibling = x->parent->left;
+                }
+                sibling->color = x->parent->color;
+                x->parent->color = BLACK;
+                sibling->left->color = BLACK;
+                right_rotate(t, x->parent);
+                x = t->root;
+            }
+        }
+    }
+    x->color = BLACK; /* safe no-op when x == t->nil: nil->color is always BLACK */
+}
+
+/* Removes key; frees the key copy and (if owned) the value. Returns 0, or -1
+ * if key is absent (tree unchanged). */
+int rb_delete(rbtree_t *t, const char *key) {
+    if (t == NULL || key == NULL) {
+        return -1;
+    }
+
+    /* phase 1: BST search for z, mirroring rb_find's descent.
+     * invariant: key, if present, lies in the subtree rooted at z */
+    rb_node_t *z = t->root;
+    while (z != t->nil) {
+        int c = strcmp(key, z->key);
+        if (c == 0) {
+            break;
+        }
+        z = (c < 0) ? z->left : z->right;
+    }
+    if (z == t->nil) {
+        return -1; /* absent: tree, size, and validity all unchanged */
+    }
+
+    /* phase 2: CLRS splice. y is the node actually removed from its spot
+     * (equal to z unless z has two children); x is the node that lands in
+     * y's old position, possibly t->nil. */
+    rb_node_t *y = z;
+    rb_color_t y_original_color = y->color;
+    rb_node_t *x;
+
+    if (z->left == t->nil) {
+        x = z->right;
+        rb_transplant(t, z, z->right);
+    } else if (z->right == t->nil) {
+        x = z->left;
+        rb_transplant(t, z, z->left);
+    } else {
+        y = rb_minimum(t, z->right);
+        y_original_color = y->color;
+        x = y->right;
+        if (y->parent == z) {
+            x->parent = y; /* needed even if x == t->nil */
+        } else {
+            rb_transplant(t, y, y->right);
+            y->right = z->right;
+            y->right->parent = y;
+        }
+        rb_transplant(t, z, y);
+        y->left = z->left;
+        y->left->parent = y;
+        y->color = z->color;
+    }
+
+    /* phase 3: release z's payload. Nothing in the tree references z anymore
+     * -- everything that pointed at z now points at y or at whatever
+     * replaced it. The value != NULL guard mirrors rb_insert's overwrite
+     * path: avoid handing a NULL to a possibly non-NULL-safe value_free. */
+    free(z->key);
+    if (t->value_free != NULL && z->value != NULL) {
+        t->value_free(z->value);
+    }
+    free(z);
+    t->size--;
+
+    /* phase 4: restore invariants only if a black node was physically
+     * removed -- splicing out a red node changes no black-height and cannot
+     * create a red-red violation. */
+    if (y_original_color == BLACK) {
+        rb_delete_fixup(t, x);
+    }
+
+    /* phase 5: sentinel hygiene. Unlike CLRS's implicit T.nil, this tree's
+     * nil is one object shared for the tree's whole lifetime, so restore its
+     * self-referential shape (rb_create's invariant) rather than leaving a
+     * stale parent pointer from this call. */
+    t->nil->parent = t->nil;
+
+    return 0;
+}
