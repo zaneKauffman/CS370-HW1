@@ -57,6 +57,70 @@ static void foreach_visit(const char *key, void *value, void *ctx) {
     fc->sum += (long)(intptr_t)value;
 }
 
+/* In-order (key, value) record of a tree, for before/after comparison. */
+#define SNAP_MAX 64
+typedef struct {
+    char keys[SNAP_MAX][16]; /* copies: the tree's key pointers may be freed */
+    void *values[SNAP_MAX];
+    int count;               /* real nodes visited */
+    int overflow;            /* 1 if the tree had more than SNAP_MAX nodes */
+} snapshot_t;
+
+static void snapshot_visit(const char *key, void *value, void *ctx) {
+    snapshot_t *s = ctx;
+    if (s->count >= SNAP_MAX) {
+        s->overflow = 1;
+        return;
+    }
+    snprintf(s->keys[s->count], sizeof s->keys[0], "%s", key);
+    s->values[s->count] = value;
+    s->count++;
+}
+
+static void take_snapshot(const rbtree_t *t, snapshot_t *s) {
+    memset(s, 0, sizeof *s);
+    rb_foreach(t, snapshot_visit, s);
+}
+
+/* 1 iff both snapshots hold the same keys and value pointers, in order. */
+static int snapshot_equal(const snapshot_t *a, const snapshot_t *b) {
+    if (a->overflow || b->overflow || a->count != b->count) {
+        return 0;
+    }
+    /* invariant: entries [0, i) already matched */
+    for (int i = 0; i < a->count; i++) {
+        if (strcmp(a->keys[i], b->keys[i]) != 0 || a->values[i] != b->values[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Caller-owned value with known contents, so a failed insert writing to it
+ * is detectable. Plain malloc: does not count toward fault_alloc_live(). */
+#define PATTERN_LEN 16
+#define PATTERN_BYTE 0xA5
+static void *patterned_val(void) {
+    unsigned char *p = malloc(PATTERN_LEN);
+    if (p == NULL) {
+        fprintf(stderr, "FAIL: out of memory in test\n");
+        exit(EXIT_FAILURE);
+    }
+    memset(p, PATTERN_BYTE, PATTERN_LEN);
+    return p;
+}
+
+static int pattern_intact(const void *p) {
+    const unsigned char *b = p;
+    /* invariant: bytes [0, i) still hold PATTERN_BYTE */
+    for (int i = 0; i < PATTERN_LEN; i++) {
+        if (b[i] != PATTERN_BYTE) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int main(void) {
     /* ---- create/destroy, no value ownership ---- */
     rbtree_t *t = rb_create(NULL);
@@ -528,13 +592,20 @@ int main(void) {
             value_frees = 0;
             t = rb_create(counting_free);
             CHECK(t != NULL);
-            void *v = heap_val();
+            void *v = patterned_val();
+            snapshot_t before, after;
+            take_snapshot(t, &before);
+            long live_before = fault_alloc_live();
 
             fault_alloc_arm(k);
             int rc = rb_insert(t, "orphan", v);
             fault_alloc_disarm();
 
             CHECK(rc == -1);                     /* documented error code */
+            CHECK(fault_alloc_live() == live_before); /* failed call leaked nothing */
+            take_snapshot(t, &after);
+            CHECK(snapshot_equal(&before, &after)); /* contents exactly as before */
+            CHECK(pattern_intact(v));            /* value bytes not written */
             CHECK(rb_size(t) == 0);              /* tree unchanged */
             CHECK(rb_validate(t) == 0);          /* still a valid RB tree */
             CHECK(rb_find(t, "orphan") == NULL); /* key not present */
@@ -557,12 +628,20 @@ int main(void) {
             CHECK(rb_size(t) == 50);
             CHECK(rb_validate(t) == 0);
 
-            void *v = heap_val();
+            void *v = patterned_val();
+            snapshot_t before, after;
+            take_snapshot(t, &before);
+            long live_before = fault_alloc_live();
+
             fault_alloc_arm(k);
             int rc = rb_insert(t, "zzz", v); /* sorts after every k0NN key */
             fault_alloc_disarm();
 
             CHECK(rc == -1);
+            CHECK(fault_alloc_live() == live_before); /* failed call leaked nothing */
+            take_snapshot(t, &after);
+            CHECK(snapshot_equal(&before, &after)); /* same keys, values, order */
+            CHECK(pattern_intact(v));          /* value bytes not written */
             CHECK(rb_size(t) == 50);           /* no size change */
             CHECK(rb_validate(t) == 0);        /* structure still valid */
             CHECK(rb_find(t, "zzz") == NULL);  /* failed key absent */
@@ -582,6 +661,49 @@ int main(void) {
 
             rb_destroy(t);
             CHECK(value_frees == 50); /* the 50 owned values, never v */
+            free(v);
+        }
+
+        /* ---- non-owning tree: failed insert leaves everything intact, and the
+         * identical retry then succeeds (no half-state left behind) ---- */
+        /* invariant: k is the 1-based index of the rb_insert allocation being
+         * failed; the tree is rebuilt fresh for each k. */
+        for (long k = 1; k <= oom_insert_allocs; k++) {
+            t = rb_create(NULL);
+            CHECK(t != NULL);
+            for (int i = 0; i < 20; i++) {
+                char kb[16];
+                mkkey(kb, sizeof kb, i);
+                CHECK(rb_insert(t, kb, (void *)(intptr_t)(i + 1)) == 0);
+            }
+
+            void *v = patterned_val();
+            snapshot_t before, after;
+            take_snapshot(t, &before);
+            long live_before = fault_alloc_live();
+
+            fault_alloc_arm(k);
+            int rc = rb_insert(t, "k010x", v); /* lands mid-tree */
+            fault_alloc_disarm();
+
+            CHECK(rc == -1);
+            CHECK(fault_alloc_live() == live_before);
+            take_snapshot(t, &after);
+            CHECK(snapshot_equal(&before, &after));
+            CHECK(rb_size(t) == 20);
+            CHECK(rb_validate(t) == 0);
+            CHECK(rb_find(t, "k010x") == NULL);
+            CHECK(pattern_intact(v));
+
+            /* retry, disarmed: must succeed exactly as if nothing had failed */
+            CHECK(rb_insert(t, "k010x", v) == 0);
+            CHECK(rb_size(t) == 21);
+            CHECK(rb_validate(t) == 0);
+            CHECK(rb_find(t, "k010x") == v);
+            CHECK(fault_alloc_live() == live_before + oom_insert_allocs);
+
+            rb_destroy(t);
+            CHECK(pattern_intact(v)); /* non-owning: destroy never touched v */
             free(v);
         }
 

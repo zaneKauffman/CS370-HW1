@@ -17,6 +17,9 @@ static long g_countdown = -1;
 /* Every rb_malloc call ever made, counting the one that gets failed. */
 static long g_total = 0;
 
+/* Successful rb_malloc results not yet passed to rb_free. */
+static long g_live = 0;
+
 void *rb_malloc(size_t n) {
     g_total++;
     /* invariant: g_countdown > 0 means this many allocations, counting this
@@ -24,10 +27,17 @@ void *rb_malloc(size_t n) {
     if (g_countdown > 0 && --g_countdown == 0) {
         return NULL; /* countdown is now 0, so this fires exactly once */
     }
-    return malloc(n);
+    void *p = malloc(n);
+    if (p != NULL) {
+        g_live++;
+    }
+    return p;
 }
 
 void rb_free(void *p) {
+    if (p != NULL) {
+        g_live--;
+    }
     free(p); /* NULL-safe, like free(); several call sites rely on that */
 }
 
@@ -43,4 +53,8 @@ void fault_alloc_disarm(void) {
 
 long fault_alloc_total(void) {
     return g_total;
+}
+
+long fault_alloc_live(void) {
+    return g_live;
 }

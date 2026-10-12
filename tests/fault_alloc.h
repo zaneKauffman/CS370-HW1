@@ -9,3 +9,6 @@ void fault_alloc_arm(long n);
 void fault_alloc_disarm(void);
 /* allocations observed so far */
 long fault_alloc_total(void);
+/* rb_malloc blocks currently outstanding (successful allocs minus non-NULL
+ * rb_free calls). Equal before/after a failed call proves it leaked nothing. */
+long fault_alloc_live(void);
