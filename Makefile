@@ -15,7 +15,7 @@ test: $(BIN) $(FUZZBIN)
 	./$(BIN) && ./$(FUZZBIN) 100000
 asan: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 asan: clean test
-memcheck: all
+memcheck: clean all
 	valgrind --leak-check=full --show-leak-kinds=all \
 		--error-exitcode=1 ./$(BIN)
 	valgrind --leak-check=full --show-leak-kinds=all \
