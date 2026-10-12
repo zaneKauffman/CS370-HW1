@@ -3,6 +3,7 @@
 #include <stdlib.h>
 
 #include "rbtree.h"
+#include "fault_alloc.h"
 
 #define KEYSPACE 200
 
@@ -126,16 +127,41 @@ int main(int argc, char **argv) {
             if (v == NULL) {
                 return fail(t, "fuzz: out of memory at iteration %ld", i);
             }
-            if (rb_insert(t, kb, v) != 0) {
+            /* Roughly one insert in 64 runs with one of rb_insert's internal
+             * allocations forced to fail, so the OOM path is fuzzed against the
+             * shadow model too. Disarmed immediately afterwards: an overwrite
+             * allocates nothing, which would otherwise leave the arm pending
+             * and misfire on a later operation. */
+            int armed = ((lcg >> 20) % 64u) == 0u;
+            if (armed) {
+                fault_alloc_arm(1 + (long)((lcg >> 24) % 2u));
+            }
+            int rc = rb_insert(t, kb, v);
+            if (armed) {
+                fault_alloc_disarm();
+            }
+            if (rc == 0) {
+                shadow[idx] = v;
+                void *got = rb_find(t, kb);
+                if (got != v) {
+                    return fail(t,
+                        "fuzz: post-insert find mismatch at iteration %ld key=%s expected=%p actual=%p",
+                        i, kb, v, got);
+                }
+            } else if (!armed) {
                 free(v);
                 return fail(t, "fuzz: rb_insert failed at iteration %ld", i);
-            }
-            shadow[idx] = v;
-            void *got = rb_find(t, kb);
-            if (got != v) {
-                return fail(t,
-                    "fuzz: post-insert find mismatch at iteration %ld key=%s expected=%p actual=%p",
-                    i, kb, v, got);
+            } else {
+                /* Contract: tree unchanged and v NOT consumed, so the shadow
+                 * entry must still hold whatever it held before. */
+                void *got = rb_find(t, kb);
+                if (got != shadow[idx]) {
+                    free(v);
+                    return fail(t,
+                        "fuzz: failed insert disturbed key %s at iteration %ld expected=%p actual=%p",
+                        kb, i, shadow[idx], got);
+                }
+                free(v); /* still ours */
             }
         } else if (op == 1) {
             void *got = rb_find(t, kb);

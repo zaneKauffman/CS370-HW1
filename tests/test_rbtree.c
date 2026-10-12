@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "rbtree.h"
+#include "fault_alloc.h"
 
 static int failures;
 
@@ -479,6 +480,170 @@ int main(void) {
     CHECK(fc3.ordered == 1);
     CHECK((size_t)fc3.count == rb_size(t));
     rb_destroy(t);
+
+    /* ================= allocation-failure (OOM) coverage =================
+     * Every internal allocation in src/rbtree.c goes through rb_malloc, so
+     * fault_alloc_arm(k) forces the k-th allocation from that point to fail.
+     * The per-operation allocation counts are measured rather than hard-coded,
+     * so these stay honest when Mutation 2 moves nodes into a slab pool. */
+    {
+        long oom_base;
+
+        /* ---- rb_create: every allocation forced to fail yields NULL ---- */
+        oom_base = fault_alloc_total();
+        t = rb_create(NULL);
+        CHECK(t != NULL);
+        long oom_create_allocs = fault_alloc_total() - oom_base;
+        rb_destroy(t);
+        CHECK(oom_create_allocs >= 1); /* tree struct + nil sentinel: 2 today */
+
+        /* invariant: k is the 1-based index of the rb_create allocation being
+         * failed; k == oom_create_allocs exercises the fail_tree: path. */
+        for (long k = 1; k <= oom_create_allocs; k++) {
+            fault_alloc_arm(k);
+            rbtree_t *ft = rb_create(counting_free);
+            fault_alloc_disarm();
+            CHECK(ft == NULL); /* contract: NULL, partial allocation released */
+            rb_destroy(ft);    /* NULL-safe; a no-op unless the CHECK failed */
+        }
+
+        /* ---- measure rb_insert's cost on a fresh key ---- */
+        long oom_insert_allocs;
+        {
+            rbtree_t *mt = rb_create(NULL); /* non-owning: probe value is ours */
+            CHECK(mt != NULL);
+            void *mv = heap_val();
+            oom_base = fault_alloc_total();
+            CHECK(rb_insert(mt, "probe", mv) == 0);
+            oom_insert_allocs = fault_alloc_total() - oom_base;
+            rb_destroy(mt);
+            free(mv);
+            CHECK(oom_insert_allocs >= 1); /* node + key copy: 2 today */
+        }
+
+        /* ---- rb_insert into an empty tree: tree unchanged, value kept ---- */
+        /* invariant: k is the 1-based index of the rb_insert allocation being
+         * failed; k == oom_insert_allocs exercises the fail_node: path. */
+        for (long k = 1; k <= oom_insert_allocs; k++) {
+            value_frees = 0;
+            t = rb_create(counting_free);
+            CHECK(t != NULL);
+            void *v = heap_val();
+
+            fault_alloc_arm(k);
+            int rc = rb_insert(t, "orphan", v);
+            fault_alloc_disarm();
+
+            CHECK(rc == -1);                     /* documented error code */
+            CHECK(rb_size(t) == 0);              /* tree unchanged */
+            CHECK(rb_validate(t) == 0);          /* still a valid RB tree */
+            CHECK(rb_find(t, "orphan") == NULL); /* key not present */
+            CHECK(value_frees == 0);             /* value NOT consumed */
+            rb_destroy(t);
+            CHECK(value_frees == 0);             /* nor consumed by destroy */
+            free(v);                             /* still ours to release */
+        }
+
+        /* ---- rb_insert into a populated tree: contents undisturbed ---- */
+        for (long k = 1; k <= oom_insert_allocs; k++) {
+            value_frees = 0;
+            t = rb_create(counting_free);
+            CHECK(t != NULL);
+            for (int i = 0; i < 50; i++) {
+                char kb[16];
+                mkkey(kb, sizeof kb, i);
+                CHECK(rb_insert(t, kb, heap_val()) == 0);
+            }
+            CHECK(rb_size(t) == 50);
+            CHECK(rb_validate(t) == 0);
+
+            void *v = heap_val();
+            fault_alloc_arm(k);
+            int rc = rb_insert(t, "zzz", v); /* sorts after every k0NN key */
+            fault_alloc_disarm();
+
+            CHECK(rc == -1);
+            CHECK(rb_size(t) == 50);           /* no size change */
+            CHECK(rb_validate(t) == 0);        /* structure still valid */
+            CHECK(rb_find(t, "zzz") == NULL);  /* failed key absent */
+            CHECK(value_frees == 0);           /* nothing freed on this path */
+
+            /* the 50 pre-existing entries must survive the failed insert */
+            foreach_ctx_t oc = {0};
+            oc.ordered = 1;
+            rb_foreach(t, foreach_visit, &oc);
+            CHECK(oc.ordered == 1);
+            CHECK(oc.count == 50);
+            for (int i = 0; i < 50; i++) {
+                char kb[16];
+                mkkey(kb, sizeof kb, i);
+                CHECK(rb_find(t, kb) != NULL);
+            }
+
+            rb_destroy(t);
+            CHECK(value_frees == 50); /* the 50 owned values, never v */
+            free(v);
+        }
+
+        /* ---- overwrite allocates nothing, so arming must not break it ---- */
+        value_frees = 0;
+        t = rb_create(counting_free);
+        CHECK(t != NULL);
+        CHECK(rb_insert(t, "dup", heap_val()) == 0);
+        void *onv = heap_val();
+        oom_base = fault_alloc_total();
+        fault_alloc_arm(1);                   /* the next allocation would fail */
+        int orc = rb_insert(t, "dup", onv);   /* but overwrite makes none */
+        fault_alloc_disarm();
+        CHECK(orc == 0);                          /* must still succeed */
+        CHECK(fault_alloc_total() == oom_base);   /* proof: zero allocations */
+        CHECK(rb_size(t) == 1);
+        CHECK(rb_find(t, "dup") == onv);
+        CHECK(value_frees == 1);                  /* old value freed */
+        rb_destroy(t);
+        CHECK(value_frees == 2);
+
+        /* ---- find/size/validate/foreach/delete allocate nothing ---- */
+        t = rb_create(NULL);
+        CHECK(t != NULL);
+        for (int i = 0; i < 20; i++) {
+            char kb[16];
+            mkkey(kb, sizeof kb, i);
+            CHECK(rb_insert(t, kb, (void *)(intptr_t)(i + 1)) == 0);
+        }
+        oom_base = fault_alloc_total();
+        foreach_ctx_t rc2 = {0};
+        rc2.ordered = 1;
+        CHECK(rb_find(t, "k005") != NULL);
+        CHECK(rb_size(t) == 20);
+        CHECK(rb_validate(t) == 0);
+        rb_foreach(t, foreach_visit, &rc2);
+        CHECK(rb_delete(t, "k005") == 0);
+        CHECK(rb_delete(t, "nope") == -1);
+        CHECK(fault_alloc_total() == oom_base); /* no read/delete path allocates */
+        rb_destroy(t);
+
+        /* ---- armed out of reach: behaviour identical to disarmed ---- */
+        fault_alloc_arm(1000000);
+        t = rb_create(NULL);
+        CHECK(t != NULL);
+        for (int i = 0; i < 100; i++) {
+            char kb[16];
+            mkkey(kb, sizeof kb, i);
+            CHECK(rb_insert(t, kb, (void *)(intptr_t)(i + 1)) == 0);
+        }
+        CHECK(rb_size(t) == 100);
+        CHECK(rb_validate(t) == 0);
+        for (int i = 0; i < 100; i += 2) {
+            char kb[16];
+            mkkey(kb, sizeof kb, i);
+            CHECK(rb_delete(t, kb) == 0);
+        }
+        CHECK(rb_size(t) == 50);
+        CHECK(rb_validate(t) == 0);
+        rb_destroy(t);
+        fault_alloc_disarm();
+    }
 
     if (failures == 0) {
         puts("test_rbtree: all checks passed");

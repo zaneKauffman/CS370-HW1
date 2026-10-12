@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "rbtree.h"
+#include "fault_alloc.h"
 
 typedef enum { RED, BLACK } rb_color_t;
 
@@ -50,12 +51,12 @@ struct rbtree {
  * `value_free` is stored verbatim; NULL means the tree does not own values.
  * Returns NULL on allocation failure, having freed any partial allocation. */
 rbtree_t *rb_create(rb_value_free_fn value_free) {
-    rbtree_t *t = malloc(sizeof *t);
+    rbtree_t *t = rb_malloc(sizeof *t);
     if (t == NULL) {
         return NULL;
     }
 
-    rb_node_t *nil = malloc(sizeof *nil);
+    rb_node_t *nil = rb_malloc(sizeof *nil);
     if (nil == NULL) {
         goto fail_tree;
     }
@@ -75,7 +76,7 @@ rbtree_t *rb_create(rb_value_free_fn value_free) {
     return t;
 
 fail_tree:
-    free(t);
+    rb_free(t);
     return NULL;
 }
 
@@ -86,11 +87,11 @@ static void rb_free_subtree(rbtree_t *t, rb_node_t *n) {
     }
     rb_free_subtree(t, n->left);
     rb_free_subtree(t, n->right);
-    free(n->key);
+    rb_free(n->key);
     if (t->value_free != NULL) {
         t->value_free(n->value);
     }
-    free(n);
+    rb_free(n);
 }
 
 /* Frees every node, key copy, and (if owned) value, then the tree and its
@@ -100,8 +101,8 @@ void rb_destroy(rbtree_t *t) {
         return;
     }
     rb_free_subtree(t, t->root);
-    free(t->nil);
-    free(t);
+    rb_free(t->nil);
+    rb_free(t);
 }
 
 /* Number of key/value pairs stored. NULL-safe, matching rb_destroy's spirit. */
@@ -186,7 +187,7 @@ int rb_validate(const rbtree_t *t) {
  * and an implicit declaration would trip -Werror. */
 static char *dup_key(const char *key) {
     size_t n = strlen(key) + 1;
-    char *copy = malloc(n);
+    char *copy = rb_malloc(n);
     if (copy == NULL) {
         return NULL;
     }
@@ -311,7 +312,7 @@ int rb_insert(rbtree_t *t, const char *key, void *value) {
     }
 
     /* phase 2: allocate everything before mutating the tree */
-    rb_node_t *n = malloc(sizeof *n);
+    rb_node_t *n = rb_malloc(sizeof *n);
     if (n == NULL) {
         goto fail;
     }
@@ -340,7 +341,7 @@ int rb_insert(rbtree_t *t, const char *key, void *value) {
     return 0;
 
 fail_node:
-    free(n);
+    rb_free(n);
 fail:
     return -1; /* tree untouched, value not consumed */
 }
@@ -535,11 +536,11 @@ int rb_delete(rbtree_t *t, const char *key) {
      * -- everything that pointed at z now points at y or at whatever
      * replaced it. The value != NULL guard mirrors rb_insert's overwrite
      * path: avoid handing a NULL to a possibly non-NULL-safe value_free. */
-    free(z->key);
+    rb_free(z->key);
     if (t->value_free != NULL && z->value != NULL) {
         t->value_free(z->value);
     }
-    free(z);
+    rb_free(z);
     t->size--;
 
     /* phase 4: restore invariants only if a black node was physically
