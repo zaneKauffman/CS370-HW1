@@ -3,6 +3,7 @@
 #include <string.h>
 #include "rbtree.h"
 #include "fault_alloc.h"
+#include "pool.h"
 
 typedef enum { RED, BLACK } rb_color_t;
 
@@ -45,7 +46,25 @@ struct rbtree {
      * an insert overwrites an existing key, -1 on a successful delete. Returned
      * as-is by rb_size(), which is therefore O(1). */
     size_t size;
+
+    /* Slab pool that real nodes are drawn from, or NULL for an rb_create()
+     * tree, whose nodes come straight from rb_malloc. The nil sentinel is
+     * always rb_malloc'd. Released by rb_destroy() after all nodes. */
+    rb_pool_t *pool;
 };
+
+/* Node storage: from the pool when the tree has one, else rb_malloc. */
+static rb_node_t *node_alloc(rbtree_t *t) {
+    return (t->pool != NULL) ? pool_alloc(t->pool) : rb_malloc(sizeof(rb_node_t));
+}
+
+static void node_free(rbtree_t *t, rb_node_t *n) {
+    if (t->pool != NULL) {
+        pool_free(t->pool, n);
+    } else {
+        rb_free(n);
+    }
+}
 
 /* Allocates an empty tree and its `nil` sentinel.
  * `value_free` is stored verbatim; NULL means the tree does not own values.
@@ -73,6 +92,7 @@ rbtree_t *rb_create(rb_value_free_fn value_free) {
     t->root = nil; /* empty tree: root == nil, never NULL */
     t->value_free = value_free;
     t->size = 0;
+    t->pool = NULL;
     return t;
 
 fail_tree:
@@ -80,27 +100,53 @@ fail_tree:
     return NULL;
 }
 
-/* Post-order free of one subtree. Depth is O(log n) for a valid RB tree. */
-static void rb_free_subtree(rbtree_t *t, rb_node_t *n) {
-    if (n == t->nil) {
-        return;
+/* As rb_create, but nodes come from a slab pool owned by the tree.
+ * Returns NULL on allocation failure, having freed any partial allocation. */
+rbtree_t *rb_create_pooled(rb_value_free_fn value_free) {
+    rbtree_t *t = rb_create(value_free);
+    if (t == NULL) {
+        return NULL;
     }
-    rb_free_subtree(t, n->left);
-    rb_free_subtree(t, n->right);
-    rb_free(n->key);
-    if (t->value_free != NULL) {
-        t->value_free(n->value);
+    t->pool = pool_create(sizeof(rb_node_t));
+    if (t->pool == NULL) {
+        goto fail_tree;
     }
-    rb_free(n);
+    return t;
+
+fail_tree:
+    rb_destroy(t); /* empty tree: frees just the sentinel and the struct */
+    return NULL;
 }
 
 /* Frees every node, key copy, and (if owned) value, then the tree and its
- * sentinel. NULL-safe per the contract. */
+ * sentinel. NULL-safe per the contract. No recursion, O(1) auxiliary space:
+ * right-rotate left children up until n has none, then free n and step right.
+ * Each rotation moves one node onto the right spine for good, so O(n) total.
+ * Parent pointers and colors are neither read nor maintained. */
 void rb_destroy(rbtree_t *t) {
     if (t == NULL) {
         return;
     }
-    rb_free_subtree(t, t->root);
+    rb_node_t *n = t->root;
+    /* invariant: n roots a BST holding exactly the nodes not yet freed */
+    while (n != t->nil) {
+        if (n->left != t->nil) {
+            rb_node_t *l = n->left; /* right rotation: l takes n's place */
+            n->left = l->right;
+            l->right = n;
+            n = l;
+        } else {
+            rb_node_t *next = n->right;
+            rb_free(n->key);
+            /* NULL guard mirrors rb_insert's overwrite and rb_delete */
+            if (t->value_free != NULL && n->value != NULL) {
+                t->value_free(n->value);
+            }
+            node_free(t, n);
+            n = next;
+        }
+    }
+    pool_destroy(t->pool); /* NULL-safe; nodes already returned to it */
     rb_free(t->nil);
     rb_free(t);
 }
@@ -311,15 +357,18 @@ int rb_insert(rbtree_t *t, const char *key, void *value) {
         cur = (cmp < 0) ? cur->left : cur->right;
     }
 
-    /* phase 2: allocate everything before mutating the tree */
-    rb_node_t *n = rb_malloc(sizeof *n);
-    if (n == NULL) {
+    /* phase 2: allocate everything before mutating the tree. Key first: a
+     * pooled node_alloc may grab a whole slab, so it must be the last thing
+     * that can fail, or a failure after it would leave that slab behind. */
+    char *kcopy = dup_key(key);
+    if (kcopy == NULL) {
         goto fail;
     }
-    n->key = dup_key(key);
-    if (n->key == NULL) {
-        goto fail_node;
+    rb_node_t *n = node_alloc(t);
+    if (n == NULL) {
+        goto fail_key;
     }
+    n->key = kcopy;
     n->value = value;
     n->color = RED;
     n->left = t->nil;
@@ -340,8 +389,8 @@ int rb_insert(rbtree_t *t, const char *key, void *value) {
     rb_insert_fixup(t, n);
     return 0;
 
-fail_node:
-    rb_free(n);
+fail_key:
+    rb_free(kcopy);
 fail:
     return -1; /* tree untouched, value not consumed */
 }
@@ -363,28 +412,39 @@ void *rb_find(const rbtree_t *t, const char *key) {
     return NULL;
 }
 
-/* In-order visit of the subtree rooted at n: left, then n itself, then right.
- * invariant: every real node in the subtree is visited exactly once, in
- * strictly increasing key order. */
-static void rb_foreach_subtree(const rbtree_t *t, const rb_node_t *n,
-                                void (*fn)(const char *key, void *value, void *ctx),
-                                void *ctx) {
-    if (n == t->nil) {
-        return;
-    }
-    rb_foreach_subtree(t, n->left, fn, ctx);
-    fn(n->key, n->value, ctx);
-    rb_foreach_subtree(t, n->right, fn, ctx);
-}
-
-/* In-order traversal; visits nothing on a NULL tree or NULL callback. */
+/* In-order traversal; visits nothing on a NULL tree or NULL callback.
+ * No recursion, O(1) auxiliary space: successor steps via parent pointers.
+ * The tree is never written (unlike Morris threading), so fn may safely
+ * call read-only operations on t. Each edge is crossed at most twice: O(n). */
 void rb_foreach(const rbtree_t *t,
                 void (*fn)(const char *key, void *value, void *ctx),
                 void *ctx) {
-    if (t == NULL || fn == NULL) {
+    if (t == NULL || fn == NULL || t->root == t->nil) {
         return;
     }
-    rb_foreach_subtree(t, t->root, fn, ctx);
+    const rb_node_t *n = t->root;
+    /* invariant: n is never nil; each step strictly descends left */
+    while (n->left != t->nil) {
+        n = n->left;
+    }
+    /* invariant: exactly the keys < n->key have been visited */
+    while (n != t->nil) {
+        fn(n->key, n->value, ctx);
+        if (n->right != t->nil) {
+            n = n->right;
+            /* invariant: n is never nil; each step strictly descends left */
+            while (n->left != t->nil) {
+                n = n->left;
+            }
+        } else {
+            /* invariant: n's subtree is fully visited; climb while it is a
+             * right child. At the root, n->parent == nil ends the walk. */
+            while (n->parent != t->nil && n == n->parent->right) {
+                n = n->parent;
+            }
+            n = n->parent;
+        }
+    }
 }
 
 /* CLRS RB-TRANSPLANT. Replaces the subtree rooted at u with the subtree
@@ -540,7 +600,7 @@ int rb_delete(rbtree_t *t, const char *key) {
     if (t->value_free != NULL && z->value != NULL) {
         t->value_free(z->value);
     }
-    rb_free(z);
+    node_free(t, z);
     t->size--;
 
     /* phase 4: restore invariants only if a black node was physically
